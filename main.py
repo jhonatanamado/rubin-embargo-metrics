@@ -4,6 +4,7 @@ from redis import asyncio as aioredis
 from os import environ
 from pythonjsonlogger import jsonlogger
 from collections import defaultdict
+from datetime import datetime, timedelta
 import logging
 import re
 import time
@@ -69,14 +70,61 @@ def update_gauge_metric(prefix, key, hash_fields_values):
     base_metric_name = f"redis_summit_embargo"
     labels = ["bucket", "instrument", "obsday"]
     metric_key_name, bucket, instrument = key.split(":")
-
+    map_obs_day={"today": datetime.now().strftime("%Y%m%d"),
+    "today-1": (datetime.now() - timedelta(days=1)).strftime("%Y%m%d"),
+    "today-2": (datetime.now() - timedelta(days=2)).strftime("%Y%m%d"),
+    "today-3": (datetime.now() - timedelta(days=3)).strftime("%Y%m%d"),
+    "today-4": (datetime.now() - timedelta(days=4)).strftime("%Y%m%d"),
+    "today-5": (datetime.now() - timedelta(days=5)).strftime("%Y%m%d"),
+    "today-6": (datetime.now() - timedelta(days=6)).strftime("%Y%m%d")}
+    #yesterday_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d") # this is for test should work with file_date == datetime.now().strftime("%Y%m%d")
     for obsday, value in hash_fields_values.items():
-        metric_labels = {'metric_key_name':metric_key_name, 'bucket': bucket, 'instrument': instrument, 'obsday': obsday}
-        metric_name = f"{base_metric_name}"  # Unique metric name for each obsday
+        mapped_obsday = next((k for k, v in map_obs_day.items() if v == obsday), "")
+        metric_labels = {'metric_key_name':metric_key_name, 'bucket': bucket, 'instrument': instrument, 'obsday':obsday, 'map_obs_day': mapped_obsday}
 
+        metric_name = f"{base_metric_name}"  # Unique metric name for each obsday
         # Create or update the metric
         gauge_metric = get_create_metric(metric_name,"Values per observation day for INGEST,FAIL,RECINSTR", "gauge", labels=list(metric_labels.keys()))
         gauge_metric.labels(**metric_labels).set(int(value))
+
+
+def update_latency_metrics(bucket, instrument, obsday, latencies):
+    base_metric_name = "redis_summit_embargo_latency"
+    labels = ["bucket", "instrument", "obsday", "latency_type", "map_obs_day"]
+
+    map_obs_day = {
+        "today": datetime.now().strftime("%Y%m%d"),
+        "today-1": (datetime.now() - timedelta(days=1)).strftime("%Y%m%d"),
+        "today-2": (datetime.now() - timedelta(days=2)).strftime("%Y%m%d"),
+        "today-3": (datetime.now() - timedelta(days=3)).strftime("%Y%m%d"),
+        "today-4": (datetime.now() - timedelta(days=4)).strftime("%Y%m%d"),
+        "today-5": (datetime.now() - timedelta(days=5)).strftime("%Y%m%d"),
+        "today-6": (datetime.now() - timedelta(days=6)).strftime("%Y%m%d")
+    }
+    mapped_obsday = next((k for k, v in map_obs_day.items() if v == obsday), "")
+
+    if latencies:
+        min_latency = min(latencies)
+        max_latency = max(latencies)
+        avg_latency = sum(latencies) / len(latencies)
+
+        for latency_type, value in [("min", min_latency), ("max", max_latency), ("avg", avg_latency)]:
+            metric_labels = {
+                'bucket': bucket,
+                'instrument': instrument,
+                'obsday': obsday,
+                'latency_type': latency_type,
+                'map_obs_day': mapped_obsday
+            }
+            metric_name = f"{base_metric_name}"
+            gauge_metric = get_create_metric(metric_name, "Latency metrics", "gauge", labels=list(metric_labels.keys()))
+            gauge_metric.labels(**metric_labels).set(value)
+
+        # Update histogram
+        hist_metric = get_create_metric(f"{base_metric_name}_histogram", "Latency histogram", "histogram", labels=["bucket", "instrument", "obsday", "map_obs_day"])
+        for latency in latencies:
+            hist_metric.labels(bucket=bucket, instrument=instrument, obsday=obsday, map_obs_day=mapped_obsday).observe(latency)
+
 
 #Startup in charge of connect to Redis
 @app.on_event('startup')
@@ -208,22 +256,49 @@ async def fetch_hash_keys_by_prefix(prefix: str):
                 db_logger.info({"event": f"Getting {prefix} hash information"})
                 cursor = '0'
                 hash_key_values = []
+                latencies = []
                 while cursor != 0:
                     cursor, keys = await redis.scan(cursor, match=f"{prefix}:*", count=100)
                     for key in keys:
                         key_type = await redis.type(key)
-                        if key_type == b'hash':
+                        if key_type == b'hash' and prefix != "FILE":
                             hash_fields_values = await redis.hgetall(key)
                             hash_fields_values_readable = {field.decode("utf-8"): value.decode("utf-8") for field, value in hash_fields_values.items()}
+                            db_logger.info({"event": f"{prefix} hash key found","key": key.decode("utf-8")})
                             hash_key_values.append({"key": key.decode("utf-8"), "values": hash_fields_values_readable})
-                            update_gauge_metric(prefix, key.decode("utf-8"), hash_fields_values_readable)
                             db_logger.debug({
                                 "event": f"{prefix} hash key found",
                                 "key": key.decode("utf-8"),
                                 "values": hash_fields_values_readable
                             })
+                            update_gauge_metric(prefix, key.decode("utf-8"), hash_fields_values_readable)
+                        if key_type == b'hash' and prefix == "FILE":
+                            hash_fields_values = await redis.hgetall(key)
+                            hash_fields_values_readable = {field.decode("utf-8"): value.decode("utf-8") for field, value in hash_fields_values.items()}
+                            key_str = key.decode("utf-8")
+                            file_date = re.search(r'\d{8}', key_str)
+                            file_date = file_date.group()
+                            #yesterday_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d") # this is for test should work with file_date == datetime.now().strftime("%Y%m%d")
+                            if set(hash_fields_values_readable.keys()) == {"recv_time", "ingest_time"} and file_date == datetime.now().strftime("%Y%m%d"):
+                                db_logger.debug({"event": f"Computing latency for {key_str}"})
+                                recv_time = float(hash_fields_values_readable["recv_time"])
+                                ingest_time = float(hash_fields_values_readable["ingest_time"])
+                                time_diff = ingest_time - recv_time
+                                latencies.append(time_diff)
+                                hash_fields_values_readable["latency"]=time_diff
+                                hash_key_values.append({"key": key.decode("utf-8"), "values": hash_fields_values_readable})
+                                db_logger.debug({
+                                    "event": f"{prefix} hash key found",
+                                    "key": key.decode("utf-8"),
+                                    "values": hash_fields_values_readable
+                                })
+
+                            else:
+                                db_logger.debug({"event": f"Skipping latency for {key_str}"})
                     if cursor == '0':
                         break
+                if latencies:
+                    update_latency_metrics('rubin-summit', 'LATISS', file_date, latencies)
                 return hash_key_values
         except Exception as e:
             logger.error({
@@ -238,6 +313,7 @@ async def fetch_hash_keys_by_prefix(prefix: str):
 @app.get("/redisdb-file-info")
 async def redisdb_file_info():
     # Measure and update metrics for get_info
+
     start_time = time.time()
     redis_db_info_data = await get_info()
     duration = time.time() - start_time
@@ -272,6 +348,16 @@ async def redisdb_file_info():
     gauge_recinstr = get_create_metric("redis_db_RECINSTR_last_duration_seconds", "Last duration for fetch_hash_keys_by_prefix operation with RECINSTR prefix", "gauge")
     hist_recinstr.observe(duration)
     gauge_recinstr.set(duration)
+
+    # Measure and update metrics for FILE
+    start_time = time.time()
+    redis_db_FILE_data = await fetch_hash_keys_by_prefix('FILE')
+    duration = time.time() - start_time
+    hist_file = get_create_metric("redis_db_FILE_duration_seconds", "Time taken for fetch_hash_keys_by_prefix operation with FILE prefix", "histogram")
+    gauge_file = get_create_metric("redis_db_FILE_last_duration_seconds", "Last duration for fetch_hash_keys_by_prefix operation with FILE prefix", "gauge")
+    hist_file.observe(duration)
+    gauge_file.set(duration)
+
 
 @app.get("/")
 def index():
